@@ -14,6 +14,7 @@ import (
 type SessionState struct {
 	// InitializeParams are the parameters from the initialize request.
 	InitializeParams *InitializeParams `json:"initializeParams"`
+	Initialized      bool              `json:"initialized"`
 
 	// LogLevel is the logging level for the session.
 	LogLevel LoggingLevel `json:"logLevel"`

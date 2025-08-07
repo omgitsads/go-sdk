@@ -744,7 +744,7 @@ func (ss *ServerSession) getConn() *jsonrpc2.Connection { return ss.conn }
 // handle invokes the method described by the given JSON RPC request.
 func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any, error) {
 	ss.mu.Lock()
-	initialized := ss.initialized
+	initialized := ss.opts.SessionState.Initialized
 	ss.mu.Unlock()
 	// From the spec:
 	// "The client SHOULD NOT send requests other than pings before the server
@@ -769,23 +769,13 @@ func (ss *ServerSession) initialize(ctx context.Context, params *InitializeParam
 	}
 	ss.mu.Lock()
 	ss.opts.SessionState.InitializeParams = params
+	ss.opts.SessionState.Initialized = true
 	ss.mu.Unlock()
 	if store := ss.opts.SessionStore; store != nil {
 		if err := store.Store(ctx, ss.opts.SessionID, ss.opts.SessionState); err != nil {
 			return nil, fmt.Errorf("storing session state: %w", err)
 		}
 	}
-
-	// Mark the connection as initialized when this method exits.
-	// TODO: Technically, the server should not be considered initialized until it has
-	// *responded*, but we don't have adequate visibility into the jsonrpc2
-	// connection to implement that easily. In any case, once we've initialized
-	// here, we can handle requests.
-	defer func() {
-		ss.mu.Lock()
-		ss.initialized = true
-		ss.mu.Unlock()
-	}()
 
 	// If we support the client's version, reply with it. Otherwise, reply with our
 	// latest version.
