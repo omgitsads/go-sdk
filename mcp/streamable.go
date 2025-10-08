@@ -390,6 +390,10 @@ func (t *StreamableServerTransport) Connect(ctx context.Context) (Connection, er
 	if t.connection.eventStore == nil {
 		t.connection.eventStore = NewMemoryEventStore(nil)
 	}
+	if t.connection.streamManager == nil {
+		sm := NewInMemoryDistributedStreamManager(t.SessionID)
+		t.connection.streamManager = sm
+	}
 	// Stream 0 corresponds to the hanging 'GET'.
 	//
 	// It is always text/event-stream, since it must carry arbitrarily many
@@ -424,6 +428,9 @@ type streamableServerConn struct {
 	// Therefore, we use a logical stream ID to key the stream state, and
 	// perform the accounting described below when incoming HTTP requests are
 	// handled.
+
+	// Stream manager
+	streamManager StreamManager
 
 	// streams holds the logical streams for this session, keyed by their ID.
 	// TODO: streams are never deleted, so the memory for a connection grows without
@@ -569,18 +576,18 @@ func (c *streamableServerConn) serveGET(w http.ResponseWriter, req *http.Request
 	}
 
 	c.mu.Lock()
-	stream, ok := c.streams[id]
+	stream := c.streamManager.GetStream(req.Context(), id)
 	c.mu.Unlock()
-	if !ok {
+	if stream == nil {
 		http.Error(w, "unknown stream", http.StatusBadRequest)
 		return
 	}
-	if !stream.signal.CompareAndSwap(nil, signalChanPtr()) {
+	if !stream.Lock() {
 		// The CAS returned false, meaning that the comparison failed: stream.signal is not nil.
 		http.Error(w, "stream ID conflicts with ongoing stream", http.StatusConflict)
 		return
 	}
-	defer stream.signal.Store(nil)
+	defer stream.Unlock()
 	persistent := id == "" // Only the special stream "" is a hanging get.
 	c.respondSSE(stream, w, req, lastIdx, persistent)
 }
@@ -647,26 +654,24 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 		}
 	}
 
-	var stream *stream // if non-nil, used to handle requests
+	var stream RequestStream // if non-nil, used to handle requests
 
 	// If we have requests, we need to handle responses along with any
 	// notifications or server->client requests made in the course of handling.
 	// Update accounting for this incoming payload.
 	if len(requests) > 0 {
-		stream, err = c.newStream(req.Context(), randText(), isInitialize, c.jsonResponse)
+		stream, err = c.streamManager.NewStream(req.Context(), randText(), isInitialize, c.jsonResponse)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("storing stream: %v", err), http.StatusInternalServerError)
 			return
 		}
 		c.mu.Lock()
-		c.streams[stream.id] = stream
-		stream.requests = requests
 		for reqID := range requests {
-			c.requestStreams[reqID] = stream.id
+			c.streamManager.SetRequestStream(req.Context(), reqID, stream)
 		}
 		c.mu.Unlock()
-		stream.signal.Store(signalChanPtr())
-		defer stream.signal.Store(nil)
+		stream.Lock()
+		defer stream.Unlock()
 	}
 
 	// Publish incoming messages.
@@ -679,17 +684,17 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
-	if stream.jsonResponse {
+	if stream.JSONResponse() {
 		c.respondJSON(stream, w, req)
 	} else {
 		c.respondSSE(stream, w, req, -1, false)
 	}
 }
 
-func (c *streamableServerConn) respondJSON(stream *stream, w http.ResponseWriter, req *http.Request) {
+func (c *streamableServerConn) respondJSON(stream RequestStream, w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Content-Type", "application/json")
-	if c.sessionID != "" && stream.isInitialize {
+	if c.sessionID != "" && stream.JSONResponse() {
 		w.Header().Set(sessionIDHeader, c.sessionID)
 	}
 
@@ -723,12 +728,12 @@ func (c *streamableServerConn) respondJSON(stream *stream, w http.ResponseWriter
 }
 
 // lastIndex is the index of the last seen event if resuming, else -1.
-func (c *streamableServerConn) respondSSE(stream *stream, w http.ResponseWriter, req *http.Request, lastIndex int, persistent bool) {
+func (c *streamableServerConn) respondSSE(stream RequestStream, w http.ResponseWriter, req *http.Request, lastIndex int, persistent bool) {
 	// Accept was checked in [StreamableHTTPHandler]
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Content-Type", "text/event-stream") // Accept checked in [StreamableHTTPHandler]
 	w.Header().Set("Connection", "keep-alive")
-	if c.sessionID != "" && stream.isInitialize {
+	if c.sessionID != "" && stream.isInitialize() {
 		w.Header().Set(sessionIDHeader, c.sessionID)
 	}
 	if persistent {
@@ -750,7 +755,7 @@ func (c *streamableServerConn) respondSSE(stream *stream, w http.ResponseWriter,
 		lastIndex++
 		e := Event{
 			Name: "message",
-			ID:   formatEventID(stream.id, lastIndex),
+			ID:   formatEventID(stream.StreamID(), lastIndex),
 			Data: data,
 		}
 		if _, err := writeEvent(w, e); err != nil {
@@ -797,13 +802,13 @@ func (c *streamableServerConn) respondSSE(stream *stream, w http.ResponseWriter,
 // If the stream did not terminate normally, it is either because ctx was
 // cancelled, or the connection is closed: check the ctx.Err() to differentiate
 // these cases.
-func (c *streamableServerConn) messages(ctx context.Context, stream *stream, persistent bool, lastIndex int) iter.Seq2[json.RawMessage, error] {
+func (c *streamableServerConn) messages(ctx context.Context, stream RequestStream, persistent bool, lastIndex int) iter.Seq2[json.RawMessage, error] {
 	return func(yield func(json.RawMessage, error) bool) {
 		for {
 			c.mu.Lock()
-			nOutstanding := len(stream.requests)
+			nOutstanding := c.streamManager.NumberOfRequestsForStream(ctx, stream.StreamID())
 			c.mu.Unlock()
-			for data, err := range c.eventStore.After(ctx, c.SessionID(), stream.id, lastIndex) {
+			for data, err := range c.eventStore.After(ctx, c.SessionID(), stream.StreamID(), lastIndex) {
 				if err != nil {
 					yield(nil, err)
 					return
@@ -822,8 +827,13 @@ func (c *streamableServerConn) messages(ctx context.Context, stream *stream, per
 				return
 			}
 
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			pendingMessages := stream.AwaitMessages(ctx)
+
 			select {
-			case <-*stream.signal.Load(): // there are new outgoing messages
+			case <-*pendingMessages: // there are new outgoing messages
 				// return to top of loop
 			case <-c.done: // session is closed
 				yield(nil, errors.New("session is closed"))
@@ -833,7 +843,6 @@ func (c *streamableServerConn) messages(ctx context.Context, stream *stream, per
 				return
 			}
 		}
-
 	}
 }
 
@@ -906,11 +915,18 @@ func (c *streamableServerConn) Write(ctx context.Context, msg jsonrpc.Message) e
 	//
 	// For messages sent outside of a request context, this is the default
 	// connection "".
-	var forStream string
+	var stream RequestStream
 	if forRequest.IsValid() {
 		c.mu.Lock()
-		forStream = c.requestStreams[forRequest]
+		s, exists, err := c.streamManager.GetRequestStream(ctx, forRequest)
 		c.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("no stream for request ID %s", forRequest)
+		}
+		stream = s
 	}
 
 	data, err := jsonrpc2.EncodeMessage(msg)
@@ -924,11 +940,6 @@ func (c *streamableServerConn) Write(ctx context.Context, msg jsonrpc.Message) e
 		return errors.New("session is closed")
 	}
 
-	stream := c.streams[forStream]
-	if stream == nil {
-		return fmt.Errorf("no stream with ID %s", forStream)
-	}
-
 	// Special case a few conditions where we fall back on stream 0 (the hanging GET):
 	//
 	//  - if forStream is known, but the associated stream is logically complete
@@ -936,26 +947,20 @@ func (c *streamableServerConn) Write(ctx context.Context, msg jsonrpc.Message) e
 	//
 	// TODO(rfindley): either of these, particularly the first, might be
 	// considered a bug in the server. Report it through a side-channel?
-	if len(stream.requests) == 0 && forStream != "" || stream.jsonResponse && !isResponse {
-		stream = c.streams[""]
+	if c.streamManager.NumberOfRequestsForStream(ctx, stream.StreamID()) == 0 && stream.StreamID() != "" || stream.JSONResponse() && !isResponse {
+		stream = c.streamManager.GetStream(ctx, "")
 	}
 
-	if err := c.eventStore.Append(ctx, c.SessionID(), stream.id, data); err != nil {
+	if err := c.eventStore.Append(ctx, c.SessionID(), stream.StreamID(), data); err != nil {
 		return fmt.Errorf("error storing event: %w", err)
 	}
 	if isResponse {
 		// Once we've put the reply on the queue, it's no longer outstanding.
-		delete(stream.requests, forRequest)
+		c.streamManager.RemoveRequestStream(ctx, forRequest)
 	}
 
 	// Signal streamResponse that new work is available.
-	signalp := stream.signal.Load()
-	if signalp != nil {
-		select {
-		case *signalp <- struct{}{}:
-		default:
-		}
-	}
+	stream.SignalNewMessages()
 	return nil
 }
 
