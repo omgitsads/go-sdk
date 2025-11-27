@@ -239,6 +239,10 @@ func (s *Server) AddTool(t *Tool, h ToolHandler) {
 		func() bool { s.tools.add(st); return true })
 }
 
+func (ss *ServerSession) NotifyToolListChanged(ctx context.Context, params *ToolListChangedParams) error {
+	return handleNotify(ctx, notificationToolListChanged, newServerRequest(ss, orZero[Params](params)))
+}
+
 func toolForErr[In, Out any](t *Tool, h ToolHandlerFor[In, Out]) (*Tool, ToolHandler, error) {
 	tt := *t
 
